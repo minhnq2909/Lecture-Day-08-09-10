@@ -10,6 +10,16 @@ import re
 from dataclasses import dataclass
 from typing import Any, Dict, List, Tuple
 
+REQUIRED_DOC_IDS = frozenset(
+    {
+        "policy_refund_v4",
+        "sla_p1_2026",
+        "it_helpdesk_faq",
+        "hr_leave_policy",
+        "access_control_sop",
+    }
+)
+
 
 @dataclass
 class ExpectationResult:
@@ -109,6 +119,67 @@ def run_expectations(cleaned_rows: List[Dict[str, Any]]) -> Tuple[List[Expectati
             ok6,
             "halt",
             f"violations={len(bad_hr_annual)}",
+        )
+    )
+
+    # E7: đủ các source hợp lệ mà bộ grading cần, tránh allowlist bỏ sót nguồn.
+    present_doc_ids = {r.get("doc_id") for r in cleaned_rows if r.get("doc_id")}
+    missing_required = sorted(REQUIRED_DOC_IDS - present_doc_ids)
+    ok7 = len(missing_required) == 0
+    results.append(
+        ExpectationResult(
+            "required_doc_ids_present",
+            ok7,
+            "halt",
+            "missing=" + ",".join(missing_required) if missing_required else "missing=0",
+        )
+    )
+
+    # E8: chunk_id phải unique để upsert/prune Chroma idempotent.
+    seen_chunk_ids: set[str] = set()
+    duplicate_chunk_ids: set[str] = set()
+    for r in cleaned_rows:
+        chunk_id = (r.get("chunk_id") or "").strip()
+        if chunk_id in seen_chunk_ids:
+            duplicate_chunk_ids.add(chunk_id)
+        seen_chunk_ids.add(chunk_id)
+    ok8 = len(duplicate_chunk_ids) == 0
+    results.append(
+        ExpectationResult(
+            "unique_chunk_id",
+            ok8,
+            "halt",
+            f"duplicate_chunk_ids={len(duplicate_chunk_ids)}",
+        )
+    )
+
+    # E9: không còn marker text low-confidence lọt vào index.
+    noisy = [
+        r
+        for r in cleaned_rows
+        if "nội dung không rõ ràng" in (r.get("chunk_text") or "").lower()
+        or "!!!" in (r.get("chunk_text") or "")
+    ]
+    ok9 = len(noisy) == 0
+    results.append(
+        ExpectationResult(
+            "no_low_confidence_markers",
+            ok9,
+            "halt",
+            f"violations={len(noisy)}",
+        )
+    )
+
+    # E10: warning nếu text vẫn còn stutter lặp từ liên tiếp sau cleaning.
+    repeated_word = re.compile(r"\b([\wÀ-ỹ]+)(\s+\1\b)+", flags=re.IGNORECASE)
+    stutter = [r for r in cleaned_rows if repeated_word.search(r.get("chunk_text") or "")]
+    ok10 = len(stutter) == 0
+    results.append(
+        ExpectationResult(
+            "no_repeated_word_stutter",
+            ok10,
+            "warn",
+            f"stutter_chunks={len(stutter)}",
         )
     )
 
