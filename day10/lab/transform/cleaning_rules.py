@@ -20,11 +20,13 @@ ALLOWED_DOC_IDS = frozenset(
         "sla_p1_2026",
         "it_helpdesk_faq",
         "hr_leave_policy",
+        "access_control_sop",
     }
 )
 
 _ISO_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 _DMY_SLASH = re.compile(r"^(\d{2})/(\d{2})/(\d{4})$")
+_REPEATED_WORD = re.compile(r"\b([\wÀ-ỹ]+)(\s+\1\b)+", flags=re.IGNORECASE)
 
 
 def _norm_text(s: str) -> str:
@@ -53,6 +55,44 @@ def _normalize_effective_date(raw: str) -> Tuple[str, str]:
     return "", "invalid_effective_date_format"
 
 
+def _has_stale_hr_annual_leave(text: str) -> bool:
+    return "10 ngày phép năm" in _norm_text(text)
+
+
+def _has_low_confidence_marker(text: str) -> bool:
+    normalized = _norm_text(text)
+    return "nội dung không rõ ràng" in normalized or "!!!" in text
+
+
+def _collapse_repeated_words(text: str) -> Tuple[str, bool]:
+    """
+    Fix OCR/export stutter such as "làm việc làm việc làm việc" while preserving meaning.
+    """
+    fixed = _REPEATED_WORD.sub(r"\1", text)
+    return fixed, fixed != text
+
+
+def _is_non_p1_sla_chunk(doc_id: str, text: str) -> bool:
+    if doc_id != "sla_p1_2026":
+        return False
+    normalized = _norm_text(text)
+    return normalized.startswith(("ticket p2:", "ticket p3:", "ticket p4:"))
+
+
+def _clarify_p1_escalation_text(doc_id: str, text: str) -> Tuple[str, bool]:
+    if doc_id != "sla_p1_2026":
+        return text, False
+    normalized = _norm_text(text)
+    if "escalation p1" not in normalized or "10 phút" not in normalized:
+        return text, False
+    clarified = (
+        "Ticket P1 auto escalation: Nếu không có phản hồi với ticket P1 sau 10 phút, "
+        "hệ thống tự động escalate lên Senior Engineer. "
+        + text
+    )
+    return clarified, True
+
+
 def load_raw_csv(path: Path) -> List[Dict[str, str]]:
     rows: List[Dict[str, str]] = []
     with path.open(encoding="utf-8", newline="") as f:
@@ -75,8 +115,13 @@ def clean_rows(
     2) Chuẩn hoá effective_date sang YYYY-MM-DD; quarantine nếu không parse được.
     3) Quarantine: chunk hr_leave_policy có effective_date < 2026-01-01 (bản HR cũ / conflict version).
     4) Quarantine: chunk_text rỗng hoặc effective_date rỗng sau chuẩn hoá.
-    5) Loại trùng nội dung chunk_text (giữ bản đầu).
-    6) Fix stale refund: policy_refund_v4 chứa '14 ngày làm việc' → 7 ngày.
+    5) Quarantine: HR 2025 marker "10 ngày phép năm" dù export date nhìn như mới.
+    6) Quarantine: low-confidence/noisy chunk có marker "Nội dung không rõ ràng" hoặc "!!!".
+    7) Quarantine: chunk SLA P2/P3/P4 lẫn trong corpus chấm SLA P1.
+    8) Loại trùng nội dung chunk_text (giữ bản đầu).
+    9) Fix stale refund: policy_refund_v4 chứa '14 ngày làm việc' → 7 ngày.
+    10) Fix repeated-word export stutter (ví dụ "làm việc làm việc").
+    11) Clarify chunk P1 escalation để retriever không nhầm với P2 escalation.
     """
     quarantine: List[Dict[str, Any]] = []
     seen_text: set[str] = set()
@@ -115,6 +160,36 @@ def clean_rows(
             quarantine.append({**raw, "reason": "missing_chunk_text"})
             continue
 
+        if doc_id == "hr_leave_policy" and _has_stale_hr_annual_leave(text):
+            quarantine.append(
+                {
+                    **raw,
+                    "reason": "stale_hr_policy_text_marker",
+                    "effective_date_normalized": eff_norm,
+                }
+            )
+            continue
+
+        if _has_low_confidence_marker(text):
+            quarantine.append(
+                {
+                    **raw,
+                    "reason": "low_confidence_chunk_text",
+                    "effective_date_normalized": eff_norm,
+                }
+            )
+            continue
+
+        if _is_non_p1_sla_chunk(doc_id, text):
+            quarantine.append(
+                {
+                    **raw,
+                    "reason": "non_p1_sla_chunk",
+                    "effective_date_normalized": eff_norm,
+                }
+            )
+            continue
+
         key = _norm_text(text)
         if key in seen_text:
             quarantine.append({**raw, "reason": "duplicate_chunk_text"})
@@ -129,6 +204,14 @@ def clean_rows(
                     "7 ngày làm việc",
                 )
                 fixed_text += " [cleaned: stale_refund_window]"
+
+        fixed_text, collapsed_repeated_words = _collapse_repeated_words(fixed_text)
+        if collapsed_repeated_words:
+            fixed_text += " [cleaned: repeated_word_stutter]"
+
+        fixed_text, clarified_p1_escalation = _clarify_p1_escalation_text(doc_id, fixed_text)
+        if clarified_p1_escalation:
+            fixed_text += " [cleaned: clarified_p1_escalation]"
 
         seq += 1
         cleaned.append(
